@@ -8,9 +8,7 @@ If you have impacket installed on your system it should not require any addition
 
 Using pipx:
 ```bash
-git clone https://github.com/caueb/group3r-python.git
-cd group3r-python
-pipx install .
+pipx install git+https://github.com/caueb/group3r-python
 group3r -h
 ```
 
