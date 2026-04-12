@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "group3r"
+version = "0.1.0"
+description = "Python port of Group3r - AD Group Policy enumeration and exploitation tool"
+requires-python = ">=3.10"
+dependencies = [
+    "ldap3>=2.9",
+    "impacket>=0.11",
+    "cryptography>=41.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov"]
+
+[project.scripts]
+group3r = "group3r.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["group3r*"]
