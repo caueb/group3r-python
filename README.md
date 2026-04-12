@@ -67,6 +67,9 @@ python group3r.py -d corp.local --dc-ip 10.0.0.1 -u user -p pass -w -a 2
 python group3r.py -d corp.local --dc-ip 10.0.0.1 -u user -p pass -v
 ```
 
+> [!TIP]
+> Load the `results.txt` into [Chimas](https://github.com/caueb/chimas) for better visualisation!
+
 ## Triage Levels
 
 | Level | Meaning |
