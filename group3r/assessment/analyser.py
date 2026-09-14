@@ -9,11 +9,11 @@ from typing import Optional
 from ..models.enums import Triage
 from ..models.findings import GpoFinding, SettingResult
 from ..models.settings import (
-    DataSourceSetting, DriveSetting, FileSetting, FileSecuritySetting,
-    GpoSetting, GroupSetting, KerbPolicySetting, NetworkShareSetting,
-    NtServiceSetting, PackageSetting, PrinterSetting, PrivRightSetting,
-    RegistrySetting, SchedTaskSetting, ScriptSetting, ShortcutSetting,
-    SystemAccessSetting, UserSetting,
+    DataSourceSetting, DriveSetting, EventAuditSetting, FileSetting,
+    FileSecuritySetting, GpoSetting, GroupSetting, KerbPolicySetting,
+    NetworkShareSetting, NtServiceSetting, PackageSetting, PrinterSetting,
+    PrivRightSetting, RegistrySetting, SchedTaskSetting, ScriptSetting,
+    ShortcutSetting, SystemAccessSetting, UserSetting,
 )
 from ..options import AssessmentOptions
 
@@ -55,6 +55,10 @@ def get_analyser(setting: GpoSetting) -> Optional[Analyser]:
     from .analysers.kerberos_policy import KerbPolicyAnalyser
     from .analysers.package import PackageAnalyser
     from .analysers.network_share import NetworkShareAnalyser
+    from .analysers.drive import DriveAnalyser
+    from .analysers.user import UserAnalyser
+    from .analysers.file_sec import FileSecAnalyser
+    from .analysers.event_audit import EventAuditAnalyser
 
     _ANALYSER_MAP: dict[type, type[Analyser]] = {
         PrivRightSetting: PrivRightAnalyser,
@@ -71,8 +75,10 @@ def get_analyser(setting: GpoSetting) -> Optional[Analyser]:
         KerbPolicySetting: KerbPolicyAnalyser,
         PackageSetting: PackageAnalyser,
         NetworkShareSetting: NetworkShareAnalyser,
-        DriveSetting: PrinterAnalyser,  # reuses cpassword check pattern
-        UserSetting: DataSourceAnalyser,  # reuses cpassword check pattern
+        DriveSetting: DriveAnalyser,
+        UserSetting: UserAnalyser,
+        FileSecuritySetting: FileSecAnalyser,
+        EventAuditSetting: EventAuditAnalyser,
     }
 
     analyser_cls = _ANALYSER_MAP.get(type(setting))

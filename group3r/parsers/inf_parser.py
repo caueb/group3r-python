@@ -13,6 +13,7 @@ from ..models.settings import (
     SystemAccessSetting,
 )
 from ..models.trustees import Trustee
+from .util import split_inf_fields
 
 logger = logging.getLogger(__name__)
 
@@ -24,28 +25,17 @@ def parse_inf_file(filepath: str, content: bytes | None = None) -> list[GpoSetti
     settings: list[GpoSetting] = []
 
     if content is not None:
-        # Decode bytes content, trying common encodings
-        for enc in ("utf-8-sig", "utf-16-le", "latin-1"):
-            try:
-                text = content.decode(enc)
-                raw_lines = text.splitlines(keepends=True)
-                break
-            except (UnicodeDecodeError, ValueError):
-                continue
-        else:
-            logger.error("Failed to decode inf content for %s", filepath)
-            return settings
+        from .util import decode_bytes
+        text = decode_bytes(content) if isinstance(content, (bytes, bytearray)) else content
+        raw_lines = text.splitlines(keepends=True)
     else:
         try:
-            with open(filepath, "r", encoding="utf-8-sig") as f:
-                raw_lines = f.readlines()
-        except Exception:
-            try:
-                with open(filepath, "r", encoding="utf-16-le") as f:
-                    raw_lines = f.readlines()
-            except Exception as e:
-                logger.error("Failed to read inf file %s: %s", filepath, e)
-                return settings
+            with open(filepath, "rb") as f:
+                from .util import decode_bytes
+                raw_lines = decode_bytes(f.read()).splitlines(keepends=True)
+        except Exception as e:
+            logger.error("Failed to read inf file %s: %s", filepath, e)
+            return settings
 
     # Strip comment lines (starting with ;)
     lines = [line.rstrip("\n\r") for line in raw_lines if not line.strip().startswith(";")]
@@ -142,7 +132,7 @@ def _parse_inf_line(heading: str, line: str, filepath: str, settings: list[GpoSe
     elif heading == "Registry Keys":
         setting = RegistrySetting(source=filepath)
         # line format: "MACHINE\path\to\key",inheritance,"SDDL"
-        full_parts = line.split(",")
+        full_parts = split_inf_fields(line)
         key_part = full_parts[0].strip().strip('"')
         reg_key_parts = key_part.split("\\")
         hive_str = reg_key_parts[0].strip('"')
@@ -177,12 +167,18 @@ def _parse_inf_line(heading: str, line: str, filepath: str, settings: list[GpoSe
         settings.append(setting)
 
     elif heading == "File Security " or heading == "File Security":
-        full_parts = line.split(",")
+        full_parts = split_inf_fields(line)
         if len(full_parts) >= 2:
+            path = full_parts[0].strip()
+            # Real secedit format: path, inheritance, SDDL
+            if len(full_parts) >= 3:
+                sddl = ",".join(full_parts[2:]).strip().strip('"')
+            else:
+                sddl = full_parts[1].strip().strip('"')
             setting = FileSecuritySetting(
                 source=filepath,
-                file_sec_path=full_parts[0].strip(),
-                sddl=full_parts[1].strip(),
+                file_sec_path=path,
+                sddl=sddl,
             )
             settings.append(setting)
 
@@ -212,6 +208,7 @@ def _parse_inf_line(heading: str, line: str, filepath: str, settings: list[GpoSe
                     source=filepath,
                     action=SettingAction.UPDATE,
                     name=group_name,
+                    group_sid=group_clean if group_clean.startswith("S-") else "",
                 )
                 gs.members.append(GroupSettingMember(
                     name=gsm.name, sid=gsm.sid, action=gsm.action))
@@ -224,6 +221,7 @@ def _parse_inf_line(heading: str, line: str, filepath: str, settings: list[GpoSe
             gs = GroupSetting(source=filepath, action=SettingAction.UPDATE)
             if group.startswith("S-"):
                 t = Trustee(sid=group)
+                gs.group_sid = group
                 gs.name = t.resolve_display_name()
             else:
                 gs.name = group
@@ -246,7 +244,7 @@ def _parse_inf_line(heading: str, line: str, filepath: str, settings: list[GpoSe
                 settings.append(gs)
 
     elif heading == "Service General Setting":
-        full_parts = line.split(",")
+        full_parts = split_inf_fields(line)
         setting = NtServiceSetting(source=filepath, service_name=line_key)
         if len(full_parts) > 1:
             setting.startup_type = full_parts[1].strip()

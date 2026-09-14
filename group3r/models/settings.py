@@ -32,6 +32,7 @@ class GpoSetting:
     source: str = ""
     policy_type: PolicyType = PolicyType.COMPUTER
     is_morphed: bool = False
+    has_filters: bool = False
 
     @staticmethod
     def decrypt_cpassword(cpassword: Optional[str]) -> Optional[str]:
@@ -39,7 +40,9 @@ class GpoSetting:
         if not cpassword:
             return None
         try:
-            # Pad base64 string
+            from cryptography.hazmat.primitives.padding import PKCS7
+
+            # Same padding cases as C# DecryptCpassword / Get-GPPPassword
             padding_needed = len(cpassword) % 4
             if padding_needed == 1:
                 cpassword += "="
@@ -53,7 +56,9 @@ class GpoSetting:
             cipher = Cipher(algorithms.AES(_GPP_AES_KEY), modes.CBC(iv))
             decryptor = cipher.decryptor()
             decrypted = decryptor.update(decoded) + decryptor.finalize()
-            return decrypted.decode("utf-16-le").rstrip("\x00")
+            unpadder = PKCS7(128).unpadder()
+            unpadded = unpadder.update(decrypted) + unpadder.finalize()
+            return unpadded.decode("utf-16-le").rstrip("\x00")
         except Exception as e:
             logger.warning("Failed to decrypt cpassword: %s", e)
             return None
@@ -446,8 +451,12 @@ class EnvVarSetting(GpoSetting):
 
 @dataclass
 class NetOptionSetting(GpoSetting):
-    """Network options (placeholder)."""
-    pass
+    """Network options / DUN / VPN GPP settings."""
+    name: str = ""
+    action: SettingAction = SettingAction.UNKNOWN
+    user_name: str = ""
+    phone_number: str = ""
+    cpassword: str = ""
 
 
 # --- Packages ---

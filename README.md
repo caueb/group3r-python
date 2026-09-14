@@ -58,7 +58,7 @@ python group3r.py -d corp.local --dc-ip 10.0.0.1 -u user -p pass -w
 # Only show enabled policies
 python group3r.py -d corp.local --dc-ip 10.0.0.1 -u user -p pass -e
 
-# Minimum triage level (0=Green, 1=Yellow, 2=Red, 3=Black)
+# Minimum triage level (real floor: 0=Green+, 1=Yellow+, 2=Red+, 3=Black only)
 python group3r.py -d corp.local --dc-ip 10.0.0.1 -u user -p pass -w -a 2
 
 # Verbose (LDAP/SMB debug)
@@ -72,10 +72,18 @@ python group3r.py -d corp.local --dc-ip 10.0.0.1 -u user -p pass -v
 
 | Level | Meaning |
 |-------|---------|
-| Black | Critical - GPP passwords, writable scripts on SYSVOL |
-| Red | High - writable command paths, low-priv in admin groups |
+| Black | Critical - GPP passwords, writable scripts (when ACLs confirm write) |
+| Red | High - network-hosted scripts/MSI/tasks, low-priv in admin groups |
 | Yellow | Medium - DLL sideloading, weak registry ACLs, credential hints |
 | Green | Low - non-default policy settings, informational |
+
+`-a` is a real floor: `-a 2` shows Red and Black only. (Original Group3r `-a 2` still showed some Yellow findings.)
+
+Online mode also:
+- Marks the authenticated user and nested groups as **Target** trustees (so ACLs/privileges granted to *you* are scored)
+- Reads GPO `nTSecurityDescriptor` with LDAP SD flags
+- Checks UNC paths over SMB for write ACLs when possible
+- Shows WMI filters linked to GPOs
 
 ## Credits
 

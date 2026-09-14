@@ -32,6 +32,9 @@ class GPOAttributes:
     version_number: str = ""
     computer_policy_enabled: bool = True
     user_policy_enabled: bool = True
+    wmi_filter_dn: str = ""
+    wmi_filter_name: str = ""
+    wmi_filter_query: str = ""
 
 
 @dataclass

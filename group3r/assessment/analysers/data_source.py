@@ -14,18 +14,11 @@ class DataSourceAnalyser(Analyser):
         setting = self.setting
 
         cpassword = getattr(setting, "cpassword", "")
-        password = getattr(setting, "password", "")
 
         if cpassword:
             decrypted = setting.decrypt_cpassword(cpassword)
             self.add_finding(GpoFinding(
                 finding_reason=f"Group Policy Preferences password found:{decrypted or cpassword}",
-                finding_detail="Refer to MS14-025 and https://adsecurity.org/?p=63",
-                triage=Triage.BLACK,
-            ))
-        elif password:
-            self.add_finding(GpoFinding(
-                finding_reason=f"Group Policy Preferences password found:{password}",
                 finding_detail="Refer to MS14-025 and https://adsecurity.org/?p=63",
                 triage=Triage.BLACK,
             ))

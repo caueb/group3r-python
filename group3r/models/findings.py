@@ -16,6 +16,7 @@ class SimpleAce:
     ace_type: str = ""  # "Allow" or "Deny"
     rights: list[str] = field(default_factory=list)
     trustee: str = ""
+    trustee_sid: str = ""
 
 
 @dataclass

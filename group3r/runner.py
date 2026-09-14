@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 
 from .ad.sysvol import load_sysvol_offline
 from .assessment.analyser import get_analyser
-from .models.enums import Triage
+from .assessment.sddl_analyser import analyse_gpo_acl
+from .models.enums import PolicyType, Triage
 from .models.findings import GpoResult, SettingResult
 from .models.gpo import GPO
 from .options import GrouperOptions
@@ -97,6 +98,14 @@ def run(options: GrouperOptions) -> None:
         try:
             _status("[*] Connecting to LDAP...")
             ad.ldap.connect()
+            if options.username:
+                _status("[*] Resolving current user groups...")
+                try:
+                    targets = ad.ldap.enumerate_target_trustees(options.username)
+                    options.assessment_options.merge_target_trustees(targets)
+                    _status(f"[+] {len(targets)} target trustee(s)")
+                except Exception as e:
+                    _status(f"[!] Target trustee enumeration failed: {e}")
             _status("[*] Enumerating GPOs from LDAP...")
             ldap_gpos = ad.ldap.enumerate_gpos()
             _status(f"[+] Found {len(ldap_gpos)} GPOs in LDAP")
@@ -104,18 +113,26 @@ def run(options: GrouperOptions) -> None:
             if ldap_gpos:
                 _status("[*] Reading SYSVOL via SMB...")
                 try:
-                    sysvol_gpos = ad.smb.enumerate_and_parse_sysvol()
+                    sysvol_gpos = ad.smb.enumerate_and_parse_sysvol(
+                        max_threads=options.max_sysvol_threads,
+                    )
                     _status(f"[+] Parsed {len(sysvol_gpos)} GPOs from SYSVOL")
 
-                    # Merge
+                    # Merge: append SYSVOL settings so LDAP-only settings survive
                     gpo_by_uid: dict[str, GPO] = {}
                     for gpo in ldap_gpos:
                         gpo_by_uid[gpo.attributes.uid.strip("{}").lower()] = gpo
                     for sg in sysvol_gpos:
                         uid = sg.attributes.uid.strip("{}").lower()
                         if uid in gpo_by_uid:
-                            gpo_by_uid[uid].settings = sg.settings
-                            gpo_by_uid[uid].gpo_files = sg.gpo_files
+                            gpo_by_uid[uid].settings.extend(sg.settings)
+                            gpo_by_uid[uid].gpo_files.extend(sg.gpo_files)
+                            if sg.attributes.path_in_sysvol:
+                                gpo_by_uid[uid].attributes.path_in_sysvol = (
+                                    sg.attributes.path_in_sysvol
+                                )
+                            if sg.attributes.is_morphed_gpo:
+                                gpo_by_uid[uid].attributes.is_morphed_gpo = True
                         else:
                             gpo_by_uid[uid] = sg
                     gpos = list(gpo_by_uid.values())
@@ -132,6 +149,27 @@ def run(options: GrouperOptions) -> None:
                     _status(f"[+] {linked}/{len(gpos)} GPOs have links")
                 except Exception as e:
                     _status(f"[!] GPO link enumeration failed: {e}")
+
+                _status("[*] Enumerating software installation packages...")
+                try:
+                    ad.ldap.enumerate_gpo_packages(gpos)
+                    pkg_count = sum(
+                        1 for g in gpos for s in g.settings
+                        if type(s).__name__ == "PackageSetting"
+                    )
+                    _status(f"[+] {pkg_count} package setting(s)")
+                except Exception as e:
+                    _status(f"[!] Package enumeration failed: {e}")
+
+                try:
+                    ad.ldap.enumerate_wmi_filters(gpos)
+                except Exception as e:
+                    _status(f"[!] WMI filter enumeration failed: {e}")
+
+                from .assessment.path_analyser import PathAnalyser
+                options.assessment_options.path_analyser = PathAnalyser(
+                    options.assessment_options, ad.smb,
+                )
         except Exception as e:
             _status(f"[!] Error: {e}")
             if options.verbose:
@@ -153,9 +191,34 @@ def run(options: GrouperOptions) -> None:
         if options.current_only and gpo.attributes.is_morphed_gpo:
             continue
 
-        result = GpoResult(attributes=gpo.attributes)
+        attrs = gpo.attributes
+        if options.enabled_only:
+            if not attrs.computer_policy_enabled and not attrs.user_policy_enabled:
+                continue
+            if not attrs.gpo_links:
+                continue
+            if not any("Enabled" in (link.link_enforced or "") for link in attrs.gpo_links):
+                continue
+
+        result = GpoResult(attributes=attrs)
+
+        if attrs.nt_security_descriptor:
+            acl_findings = analyse_gpo_acl(
+                attrs.nt_security_descriptor, options.assessment_options
+            )
+            for finding in acl_findings:
+                if finding.triage >= options.min_triage:
+                    result.gpo_attribute_findings.append(finding)
+                    result.gpo_acl_results.extend(finding.acl_result)
+                    total_findings += 1
 
         for setting in gpo.settings:
+            if options.enabled_only:
+                if setting.policy_type == PolicyType.COMPUTER and not attrs.computer_policy_enabled:
+                    continue
+                if setting.policy_type == PolicyType.USER and not attrs.user_policy_enabled:
+                    continue
+
             analyser = get_analyser(setting)
             if analyser is None:
                 continue
@@ -167,6 +230,9 @@ def run(options: GrouperOptions) -> None:
             if setting_result.findings or not options.findings_only:
                 result.setting_results.append(setting_result)
                 total_findings += len(setting_result.findings)
+
+        if options.findings_only and not result.setting_results and not result.gpo_attribute_findings:
+            continue
 
         all_results.append(result)
 

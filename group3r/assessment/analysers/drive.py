@@ -1,23 +1,22 @@
-"""Analyser for Printer settings (GPP cpassword)."""
+"""Analyser for Drive mapping settings (GPP cpassword)."""
 
 from __future__ import annotations
 
 from ...models.enums import Triage
 from ...models.findings import GpoFinding, SettingResult
+from ...models.settings import DriveSetting
 from ...options import AssessmentOptions
 from ..analyser import Analyser
 
 
-class PrinterAnalyser(Analyser):
+class DriveAnalyser(Analyser):
     def analyse(self, options: AssessmentOptions) -> SettingResult:
-        setting = self.setting
+        setting: DriveSetting = self.setting
 
-        cpassword = getattr(setting, "cpassword", "")
-
-        if cpassword:
-            decrypted = setting.decrypt_cpassword(cpassword)
+        if setting.cpassword:
+            decrypted = setting.decrypt_cpassword(setting.cpassword)
             self.add_finding(GpoFinding(
-                finding_reason=f"Group Policy Preferences password found:{decrypted or cpassword}",
+                finding_reason=f"Group Policy Preferences password found:{decrypted or setting.cpassword}",
                 finding_detail="Refer to MS14-025 and https://adsecurity.org/?p=63",
                 triage=Triage.BLACK,
             ))

@@ -48,20 +48,49 @@ class AssessmentOptions:
     priv_rights: list[dict] = field(default_factory=list)
     trustee_options: list[dict] = field(default_factory=list)
     reg_keys: list[dict] = field(default_factory=list)
+    path_analyser: object = None
 
     def __post_init__(self):
         from .data.priv_rights import PRIV_RIGHTS
         from .data.trustees import TRUSTEE_OPTIONS
         if not self.priv_rights:
-            self.priv_rights = PRIV_RIGHTS
+            self.priv_rights = list(PRIV_RIGHTS)
         if not self.trustee_options:
-            self.trustee_options = TRUSTEE_OPTIONS
+            self.trustee_options = [dict(t) for t in TRUSTEE_OPTIONS]
         try:
             from .data.reg_keys import REG_KEYS
             if not self.reg_keys:
-                self.reg_keys = REG_KEYS
+                self.reg_keys = list(REG_KEYS)
         except ImportError:
             pass
+
+    def merge_target_trustees(self, trustees: list[dict]) -> int:
+        """Mark matching well-known trustees Target, append unknown ones."""
+        added = 0
+        for t in trustees:
+            sid = t.get("sid") or ""
+            name = t.get("display_name") or ""
+            matched = False
+            for existing in self.trustee_options:
+                if sid and existing.get("sid") == sid:
+                    existing["target"] = True
+                    matched = True
+                elif name and existing.get("display_name", "").lower() == name.lower():
+                    existing["target"] = True
+                    matched = True
+            if not matched:
+                self.trustee_options.append({
+                    "sid": sid,
+                    "display_name": name,
+                    "description": "Authenticated session trustee",
+                    "domain_sid": False,
+                    "local_sid": False,
+                    "high_priv": False,
+                    "low_priv": False,
+                    "target": True,
+                })
+                added += 1
+        return added
 
 
 @dataclass

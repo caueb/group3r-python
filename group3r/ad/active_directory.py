@@ -77,24 +77,35 @@ class ActiveDirectory:
 
         logger.info("Parsed %d GPOs from SYSVOL", len(sysvol_gpos))
 
-        # Step 3: Merge parsed settings into LDAP GPO objects
+        # Step 3: Merge parsed settings into LDAP GPO objects (append, so
+        # LDAP-only settings like packages survive).
         for sysvol_gpo in sysvol_gpos:
             uid = sysvol_gpo.attributes.uid.strip("{}").lower()
             if uid in gpo_by_uid:
-                gpo_by_uid[uid].settings = sysvol_gpo.settings
-                gpo_by_uid[uid].gpo_files = sysvol_gpo.gpo_files
+                gpo_by_uid[uid].settings.extend(sysvol_gpo.settings)
+                gpo_by_uid[uid].gpo_files.extend(sysvol_gpo.gpo_files)
+                if sysvol_gpo.attributes.path_in_sysvol:
+                    gpo_by_uid[uid].attributes.path_in_sysvol = (
+                        sysvol_gpo.attributes.path_in_sysvol
+                    )
+                if sysvol_gpo.attributes.is_morphed_gpo:
+                    gpo_by_uid[uid].attributes.is_morphed_gpo = True
             else:
                 logger.debug("GPO %s in SYSVOL but not LDAP (orphaned)", uid)
                 gpo_by_uid[uid] = sysvol_gpo
 
-        # Get GPO links (one bulk query for all OUs, matching original C# approach)
         all_gpos = list(gpo_by_uid.values())
         try:
             self.ldap.enumerate_gpo_links(all_gpos)
         except Exception as e:
             logger.debug("Failed to enumerate GPO links: %s", e)
 
-        return list(gpo_by_uid.values())
+        try:
+            self.ldap.enumerate_gpo_packages(all_gpos)
+        except Exception as e:
+            logger.debug("Failed to enumerate GPO packages: %s", e)
+
+        return all_gpos
 
     def cleanup(self) -> None:
         """Close connections."""

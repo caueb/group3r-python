@@ -39,8 +39,9 @@ def _serialize(obj: Any) -> Any:
         for field_name in obj.__dataclass_fields__:
             val = getattr(obj, field_name)
             serialized = _serialize(val)
-            # Skip empty/default fields to keep JSON compact
-            if serialized in (None, "", [], {}, 0, False):
+            # Skip empty fields to keep JSON compact. Keep 0 / False so
+            # Triage.GREEN (0) is not dropped from findings.
+            if serialized in (None, "", [], {}):
                 continue
             result[field_name] = serialized
         return result

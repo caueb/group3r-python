@@ -19,7 +19,7 @@ GPO_ATTRIBUTES = [
     "displayName", "cn", "gPCFileSysPath", "gPCMachineExtensionNames",
     "gPCUserExtensionNames", "whenCreated", "whenChanged",
     "nTSecurityDescriptor", "distinguishedName", "flags",
-    "versionNumber", "gPLink",
+    "versionNumber", "gPLink", "gPCWQLFilter",
 ]
 
 
@@ -291,10 +291,9 @@ class LdapClient:
         logger.info("Searching for GPOs in: %s", search_base)
 
         try:
-            resp = self._connection.search(
-                searchBase=search_base,
-                searchFilter="(objectClass=groupPolicyContainer)",
-                attributes=GPO_ATTRIBUTES,
+            resp = self._search_impacket(
+                search_base, "(objectClass=groupPolicyContainer)",
+                GPO_ATTRIBUTES, sd_flags=True,
             )
         except Exception as e:
             logger.error("LDAP GPO search failed: %s", e)
@@ -335,13 +334,13 @@ class LdapClient:
                         attrs.computer_policy_enabled = not (flags & 2)
                     except ValueError:
                         pass
+                elif attr_name == "gPCWQLFilter":
+                    attrs.wmi_filter_dn = _wmi_filter_dn(val)
                 elif attr_name == "nTSecurityDescriptor":
                     try:
-                        from impacket.ldap.ldaptypes import SR_SECURITY_DESCRIPTOR
                         raw = bytes(vals[0])
-                        sd = SR_SECURITY_DESCRIPTOR()
-                        sd.fromString(raw)
-                        attrs.nt_security_descriptor = sd.toSddl()
+                        from ..sddl.from_binary import security_descriptor_to_sddl
+                        attrs.nt_security_descriptor = security_descriptor_to_sddl(raw)
                     except Exception as e:
                         logger.debug("Failed to parse SD: %s", e)
 
@@ -359,26 +358,19 @@ class LdapClient:
         logger.info("Searching for GPOs in: %s", search_base)
 
         try:
-            result = self._connection.search(
-                search_base=search_base,
-                search_filter="(objectClass=groupPolicyContainer)",
-                search_scope=ldap3.SUBTREE,
-                attributes=GPO_ATTRIBUTES,
+            result = self._search_ldap3(
+                search_base, "(objectClass=groupPolicyContainer)",
+                GPO_ATTRIBUTES, sd_flags=True,
             )
         except Exception as e:
             logger.error("LDAP search failed: %s", e)
             raise RuntimeError(f"LDAP GPO search failed: {e}") from e
 
         if not result:
-            ldap_result = self._connection.result
-            code = ldap_result.get("result", -1)
-            desc = ldap_result.get("description", "")
-            msg = ldap_result.get("message", "")
-            logger.warning("LDAP search returned no results. Code: %s (%s): %s",
-                           code, desc, msg)
+            logger.warning("LDAP search returned no GPO results")
             return gpos
 
-        for entry in self._connection.entries:
+        for entry in result:
             gpo = GPO()
             attrs = gpo.attributes
             attrs.display_name = str(entry.displayName) if hasattr(entry, "displayName") else ""
@@ -400,12 +392,15 @@ class LdapClient:
                     attrs.computer_policy_enabled = not (flags & 2)
                 except (ValueError, TypeError):
                     pass
+            if hasattr(entry, "gPCWQLFilter") and entry.gPCWQLFilter.value:
+                attrs.wmi_filter_dn = _wmi_filter_dn(str(entry.gPCWQLFilter.value))
             if hasattr(entry, "nTSecurityDescriptor") and entry.nTSecurityDescriptor.value:
                 try:
-                    from impacket.ldap.ldaptypes import SR_SECURITY_DESCRIPTOR
-                    sd = SR_SECURITY_DESCRIPTOR()
-                    sd.fromString(entry.nTSecurityDescriptor.value)
-                    attrs.nt_security_descriptor = sd.toSddl()
+                    raw = entry.nTSecurityDescriptor.value
+                    if isinstance(raw, list):
+                        raw = raw[0]
+                    from ..sddl.from_binary import security_descriptor_to_sddl
+                    attrs.nt_security_descriptor = security_descriptor_to_sddl(bytes(raw))
                 except Exception as e:
                     logger.debug("Failed to parse SD for %s: %s", attrs.uid, e)
             gpos.append(gpo)
@@ -462,10 +457,9 @@ class LdapClient:
 
         ldap_filter = "(|(objectClass=organizationalUnit)(objectClass=site)(objectClass=domain))"
         try:
-            resp = self._connection.search(
-                searchBase=self._base_dn,
-                searchFilter=ldap_filter,
-                attributes=["distinguishedName", "gplink", "gpoptions"],
+            resp = self._search_impacket(
+                self._base_dn, ldap_filter,
+                ["distinguishedName", "gplink", "gpoptions"],
             )
         except Exception as e:
             logger.debug("Failed to enumerate GPO links: %s", e)
@@ -495,17 +489,15 @@ class LdapClient:
 
         ldap_filter = "(|(objectClass=organizationalUnit)(objectClass=site)(objectClass=domain))"
         try:
-            self._connection.search(
-                search_base=self._base_dn,
-                search_filter=ldap_filter,
-                search_scope=ldap3.SUBTREE,
-                attributes=["distinguishedName", "gplink", "gpoptions"],
+            entries = self._search_ldap3(
+                self._base_dn, ldap_filter,
+                ["distinguishedName", "gplink", "gpoptions"],
             )
         except Exception as e:
             logger.debug("Failed to enumerate GPO links: %s", e)
             return
 
-        for entry in self._connection.entries:
+        for entry in entries:
             ou_dn = str(entry.distinguishedName) if hasattr(entry, "distinguishedName") else ""
             gplink_val = str(entry.gplink) if hasattr(entry, "gplink") and entry.gplink.value else ""
             if gplink_val:
@@ -552,6 +544,444 @@ class LdapClient:
             )
             gpo.attributes.gpo_links.append(link)
 
+    def enumerate_gpo_packages(self, gpos: list[GPO]) -> None:
+        """Attach software installation (packageRegistration) settings to GPOs.
+
+        Mirrors C# ActiveDirectory.EnumerateGpoPackages().
+        """
+        if not self._connection:
+            return
+        if self._backend == "impacket":
+            self._enumerate_packages_impacket(gpos)
+        else:
+            self._enumerate_packages_ldap3(gpos)
+
+    def _attach_package(self, gpos: list[GPO], attrs: dict) -> None:
+        from ..models.enums import PolicyType
+        from ..models.settings import PackageSetting
+
+        dn = attrs.get("distinguishedName") or ""
+        if not dn:
+            return
+        parts = [p.strip() for p in dn.split(",")]
+        if len(parts) < 5:
+            return
+        try:
+            parent_gpo = parts[len(parts) - 5].split("=", 1)[1]
+        except (IndexError, ValueError):
+            return
+
+        pkg = PackageSetting(source="LDAP")
+        pkg.display_name = attrs.get("displayName") or ""
+        pkg.distinguished_name = dn
+        pkg.cn = attrs.get("cn") or ""
+        pkg.parent_gpo = parent_gpo
+        pkg.msi_script_name = attrs.get("msiScriptName") or ""
+        pkg.created_date = attrs.get("whenCreated")
+        pkg.modified_date = attrs.get("whenChanged")
+        pkg.policy_type = PolicyType.PACKAGE
+
+        msi_list = attrs.get("msiFileList") or []
+        if isinstance(msi_list, str):
+            msi_list = [msi_list]
+        for entry in msi_list:
+            for path in str(entry).split(":"):
+                path = path.strip()
+                if not path or path == "0":
+                    continue
+                pkg.msi_file_list.append(path)
+
+        if len(parts) > 3 and parts[3].lower() == "cn=user":
+            script = pkg.msi_script_name
+            if script == "A":
+                pkg.package_action = "User Assigned"
+            elif script == "P":
+                pkg.package_action = "User Published"
+            elif script == "R":
+                pkg.package_action = "Package Removed"
+        else:
+            pkg.package_action = "Computer Assigned"
+
+        parent_uid = parent_gpo.strip("{}").lower()
+        for gpo in gpos:
+            if gpo.attributes.uid.strip("{}").lower() == parent_uid:
+                gpo.settings.append(pkg)
+                return
+
+    def _enumerate_packages_impacket(self, gpos: list[GPO]) -> None:
+        from impacket.ldap import ldapasn1
+
+        try:
+            resp = self._search_impacket(
+                self._base_dn, "(objectClass=packageRegistration)",
+                [
+                    "displayName", "distinguishedName", "msiFileList",
+                    "msiScriptName", "productCode", "whenCreated",
+                    "whenChanged", "upgradeProductCode", "cn",
+                ],
+            )
+        except Exception as e:
+            logger.debug("Package LDAP search failed: %s", e)
+            return
+
+        count = 0
+        for item in resp:
+            if not isinstance(item, ldapasn1.SearchResultEntry):
+                continue
+            attrs: dict = {}
+            for attr in item["attributes"]:
+                name = str(attr["type"])
+                vals = attr["vals"]
+                if not vals:
+                    continue
+                if name == "msiFileList":
+                    attrs[name] = [str(v) for v in vals]
+                elif name in ("whenCreated", "whenChanged"):
+                    attrs[name] = _parse_ldap_timestamp(str(vals[0]))
+                else:
+                    attrs[name] = str(vals[0])
+            self._attach_package(gpos, attrs)
+            count += 1
+        logger.info("Attached %d software packages from LDAP", count)
+
+    def _enumerate_packages_ldap3(self, gpos: list[GPO]) -> None:
+        import ldap3
+
+        try:
+            entries = self._search_ldap3(
+                self._base_dn, "(objectClass=packageRegistration)",
+                [
+                    "displayName", "distinguishedName", "msiFileList",
+                    "msiScriptName", "productCode", "whenCreated",
+                    "whenChanged", "upgradeProductCode", "cn",
+                ],
+            )
+        except Exception as e:
+            logger.debug("Package LDAP search failed: %s", e)
+            return
+
+        count = 0
+        for entry in entries:
+            attrs: dict = {
+                "displayName": str(entry.displayName) if hasattr(entry, "displayName") else "",
+                "distinguishedName": (
+                    str(entry.distinguishedName) if hasattr(entry, "distinguishedName") else ""
+                ),
+                "cn": str(entry.cn) if hasattr(entry, "cn") else "",
+                "msiScriptName": (
+                    str(entry.msiScriptName) if hasattr(entry, "msiScriptName") else ""
+                ),
+            }
+            if hasattr(entry, "msiFileList") and entry.msiFileList.value:
+                val = entry.msiFileList.value
+                attrs["msiFileList"] = val if isinstance(val, list) else [val]
+            if hasattr(entry, "whenCreated") and entry.whenCreated.value:
+                attrs["whenCreated"] = entry.whenCreated.value
+            if hasattr(entry, "whenChanged") and entry.whenChanged.value:
+                attrs["whenChanged"] = entry.whenChanged.value
+            self._attach_package(gpos, attrs)
+            count += 1
+        logger.info("Attached %d software packages from LDAP", count)
+
+    def _search_impacket(self, base: str, search_filter: str,
+                         attributes: list[str], sd_flags: bool = False):
+        from impacket.ldap.ldapasn1 import SimplePagedResultsControl, SDFlagsControl
+
+        controls = [SimplePagedResultsControl(size=1000)]
+        if sd_flags:
+            controls.append(SDFlagsControl(flags=0x07))
+        return self._connection.search(
+            searchBase=base,
+            searchFilter=search_filter,
+            attributes=attributes,
+            searchControls=controls,
+        )
+
+    def _search_ldap3(self, base: str, search_filter: str,
+                      attributes: list[str], sd_flags: bool = False):
+        import ldap3
+
+        controls = None
+        if sd_flags:
+            from ldap3.protocol.microsoft import security_descriptor_control
+            controls = security_descriptor_control(sdflags=7)
+
+        entries = []
+        cookie = True
+        while cookie:
+            kwargs = dict(
+                search_base=base,
+                search_filter=search_filter,
+                search_scope=ldap3.SUBTREE,
+                attributes=attributes,
+                paged_size=1000,
+            )
+            if controls is not None:
+                kwargs["controls"] = controls
+            if cookie is not True:
+                kwargs["paged_cookie"] = cookie
+            self._connection.search(**kwargs)
+            entries.extend(list(self._connection.entries))
+            cookie = None
+            ctrls = (self._connection.result or {}).get("controls") or {}
+            paged = ctrls.get("1.2.840.113556.1.4.319") or {}
+            value = paged.get("value") or {}
+            cookie = value.get("cookie") or None
+        return entries
+
+    def enumerate_target_trustees(self, username: str) -> list[dict]:
+        """Resolve the bind user and nested groups as Target trustees.
+
+        Uses tokenGroups (nested membership) rather than recursive member= walks.
+        """
+        if not username or not self._connection:
+            return []
+        sam = username.split("\\")[-1].split("@")[0]
+        if self._backend == "impacket":
+            return self._target_trustees_impacket(sam)
+        return self._target_trustees_ldap3(sam)
+
+    def _target_trustees_impacket(self, sam: str) -> list[dict]:
+        from impacket.ldap import ldapasn1
+        from impacket.ldap.ldaptypes import LDAP_SID
+
+        try:
+            resp = self._search_impacket(
+                self._base_dn,
+                f"(&(objectClass=user)(sAMAccountName={_ldap_escape(sam)}))",
+                ["distinguishedName", "objectSid", "cn", "sAMAccountName"],
+            )
+        except Exception as e:
+            logger.debug("Target user search failed: %s", e)
+            return [{"display_name": sam, "sid": "", "target": True}]
+
+        user_dn = ""
+        user_sid = ""
+        user_cn = sam
+        for item in resp:
+            if not isinstance(item, ldapasn1.SearchResultEntry):
+                continue
+            for attr in item["attributes"]:
+                name = str(attr["type"])
+                if not attr["vals"]:
+                    continue
+                if name == "distinguishedName":
+                    user_dn = str(attr["vals"][0])
+                elif name == "cn":
+                    user_cn = str(attr["vals"][0])
+                elif name == "objectSid":
+                    try:
+                        user_sid = LDAP_SID(data=bytes(attr["vals"][0])).formatCanonical()
+                    except Exception:
+                        user_sid = ""
+            if user_dn:
+                break
+        if not user_dn:
+            logger.warning("Failed to find target user %s in domain", sam)
+            return [{"display_name": sam, "sid": "", "target": True}]
+
+        results = [{"display_name": user_cn, "sid": user_sid, "target": True}]
+        try:
+            from impacket.ldap.ldapasn1 import Scope
+            resp = self._connection.search(
+                searchBase=user_dn,
+                searchFilter="(objectClass=*)",
+                scope=Scope("baseObject"),
+                attributes=["tokenGroups"],
+            )
+        except Exception as e:
+            logger.debug("tokenGroups query failed: %s", e)
+            return results
+
+        sids: list[str] = []
+        for item in resp:
+            if not isinstance(item, ldapasn1.SearchResultEntry):
+                continue
+            for attr in item["attributes"]:
+                if str(attr["type"]) == "tokenGroups":
+                    for val in attr["vals"]:
+                        try:
+                            sids.append(LDAP_SID(data=bytes(val)).formatCanonical())
+                        except Exception:
+                            pass
+        results.extend(self._resolve_group_sids(sids))
+        return results
+
+    def _target_trustees_ldap3(self, sam: str) -> list[dict]:
+        import ldap3
+        from impacket.ldap.ldaptypes import LDAP_SID
+
+        entries = self._search_ldap3(
+            self._base_dn,
+            f"(&(objectClass=user)(sAMAccountName={_ldap_escape(sam)}))",
+            ["distinguishedName", "objectSid", "cn", "sAMAccountName"],
+        )
+        if not entries:
+            logger.warning("Failed to find target user %s in domain", sam)
+            return [{"display_name": sam, "sid": "", "target": True}]
+
+        entry = entries[0]
+        user_dn = str(entry.distinguishedName) if hasattr(entry, "distinguishedName") else ""
+        user_cn = str(entry.cn) if hasattr(entry, "cn") else sam
+        user_sid = ""
+        if hasattr(entry, "objectSid") and entry.objectSid.value:
+            try:
+                raw = entry.objectSid.value
+                user_sid = LDAP_SID(data=bytes(raw)).formatCanonical()
+            except Exception:
+                user_sid = str(entry.objectSid)
+        results = [{"display_name": user_cn, "sid": user_sid, "target": True}]
+        if not user_dn:
+            return results
+
+        try:
+            self._connection.search(
+                search_base=user_dn,
+                search_filter="(objectClass=*)",
+                search_scope=ldap3.BASE,
+                attributes=["tokenGroups"],
+            )
+        except Exception as e:
+            logger.debug("tokenGroups query failed: %s", e)
+            return results
+
+        sids: list[str] = []
+        for tg in self._connection.entries:
+            if hasattr(tg, "tokenGroups") and tg.tokenGroups.value:
+                vals = tg.tokenGroups.value
+                if not isinstance(vals, list):
+                    vals = [vals]
+                for val in vals:
+                    try:
+                        sids.append(LDAP_SID(data=bytes(val)).formatCanonical())
+                    except Exception:
+                        pass
+        results.extend(self._resolve_group_sids(sids))
+        return results
+
+    def _resolve_group_sids(self, sids: list[str]) -> list[dict]:
+        """Best-effort SID → name. Unknown SIDs are still returned as targets."""
+        out: list[dict] = []
+        remaining = list(sids)
+        # Resolve in chunks to keep filters short
+        while remaining:
+            chunk = remaining[:20]
+            remaining = remaining[20:]
+            filt = "(|" + "".join(f"(objectSid={sid})" for sid in chunk) + ")"
+            names: dict[str, str] = {}
+            try:
+                if self._backend == "impacket":
+                    from impacket.ldap import ldapasn1
+                    from impacket.ldap.ldaptypes import LDAP_SID
+                    resp = self._search_impacket(
+                        self._base_dn, filt, ["objectSid", "sAMAccountName", "cn"],
+                    )
+                    for item in resp:
+                        if not isinstance(item, ldapasn1.SearchResultEntry):
+                            continue
+                        sid = cn = ""
+                        for attr in item["attributes"]:
+                            n = str(attr["type"])
+                            if not attr["vals"]:
+                                continue
+                            if n == "cn":
+                                cn = str(attr["vals"][0])
+                            elif n == "sAMAccountName" and not cn:
+                                cn = str(attr["vals"][0])
+                            elif n == "objectSid":
+                                sid = LDAP_SID(data=bytes(attr["vals"][0])).formatCanonical()
+                        if sid:
+                            names[sid] = cn or sid
+                else:
+                    entries = self._search_ldap3(
+                        self._base_dn, filt, ["objectSid", "sAMAccountName", "cn"],
+                    )
+                    for entry in entries:
+                        cn = str(entry.cn) if hasattr(entry, "cn") else ""
+                        sid = ""
+                        if hasattr(entry, "objectSid") and entry.objectSid.value:
+                            try:
+                                from impacket.ldap.ldaptypes import LDAP_SID
+                                sid = LDAP_SID(data=bytes(entry.objectSid.value)).formatCanonical()
+                            except Exception:
+                                sid = str(entry.objectSid)
+                        if sid:
+                            names[sid] = cn or sid
+            except Exception as e:
+                logger.debug("SID resolve failed: %s", e)
+            for sid in chunk:
+                out.append({
+                    "display_name": names.get(sid, sid),
+                    "sid": sid,
+                    "target": True,
+                })
+        return out
+
+    def enumerate_wmi_filters(self, gpos: list[GPO]) -> None:
+        """Fill wmi_filter_name / wmi_filter_query from msWMI-Som objects."""
+        dns = [g.attributes.wmi_filter_dn for g in gpos if g.attributes.wmi_filter_dn]
+        if not dns or not self._connection:
+            return
+        by_dn = {dn.lower(): [] for dn in dns}
+        for gpo in gpos:
+            dn = gpo.attributes.wmi_filter_dn
+            if dn:
+                by_dn.setdefault(dn.lower(), []).append(gpo)
+
+        for dn in list(by_dn):
+            try:
+                name, query = self._read_wmi_filter(dn)
+            except Exception as e:
+                logger.debug("WMI filter %s: %s", dn, e)
+                continue
+            for gpo in by_dn[dn]:
+                gpo.attributes.wmi_filter_name = name
+                gpo.attributes.wmi_filter_query = query
+
+    def _read_wmi_filter(self, dn: str) -> tuple[str, str]:
+        if self._backend == "impacket":
+            from impacket.ldap import ldapasn1
+            from impacket.ldap.ldapasn1 import Scope
+            resp = self._connection.search(
+                searchBase=dn,
+                searchFilter="(objectClass=msWMI-Som)",
+                scope=Scope("baseObject"),
+                attributes=["msWMI-Name", "msWMI-Parm1", "displayName"],
+            )
+            name = query = ""
+            for item in resp:
+                if not isinstance(item, ldapasn1.SearchResultEntry):
+                    continue
+                for attr in item["attributes"]:
+                    n = str(attr["type"])
+                    if not attr["vals"]:
+                        continue
+                    if n in ("msWMI-Name", "displayName") and not name:
+                        name = str(attr["vals"][0])
+                    elif n == "msWMI-Parm1":
+                        query = str(attr["vals"][0])
+            return name, query
+
+        import ldap3
+        self._connection.search(
+            search_base=dn,
+            search_filter="(objectClass=msWMI-Som)",
+            search_scope=ldap3.BASE,
+            attributes=["msWMI-Name", "msWMI-Parm1", "displayName"],
+        )
+        name = query = ""
+        for entry in self._connection.entries:
+            attrs = entry.entry_attributes_as_dict
+            raw_name = attrs.get("msWMI-Name") or attrs.get("displayName")
+            raw_query = attrs.get("msWMI-Parm1")
+            if isinstance(raw_name, list):
+                raw_name = raw_name[0] if raw_name else ""
+            if isinstance(raw_query, list):
+                raw_query = raw_query[0] if raw_query else ""
+            name = str(raw_name or "")
+            query = str(raw_query or "")
+        return name, query
+
     def close(self) -> None:
         """Close LDAP connection."""
         if self._connection:
@@ -563,6 +993,32 @@ class LdapClient:
             except Exception:
                 pass
             self._connection = None
+
+
+def _ldap_escape(value: str) -> str:
+    """Escape LDAP filter special characters."""
+    return (
+        value.replace("\\", r"\5c")
+        .replace("*", r"\2a")
+        .replace("(", r"\28")
+        .replace(")", r"\29")
+        .replace("\x00", r"\00")
+    )
+
+
+def _wmi_filter_dn(raw: str) -> str:
+    """Extract the WMI filter DN from gPCWQLFilter ([LDAP://DN;flag])."""
+    if not raw:
+        return ""
+    text = raw.strip().strip("[]")
+    if text.upper().startswith("LDAP://"):
+        text = text[7:]
+    elif text.upper().startswith("LDAP:"):
+        text = text[5:]
+    text = text.lstrip("/")
+    if ";" in text:
+        text = text.split(";", 1)[0]
+    return text.strip()
 
 
 def _parse_ldap_timestamp(val: str):

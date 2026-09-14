@@ -7,6 +7,7 @@ from ...models.findings import GpoFinding, SettingResult
 from ...models.settings import NtServiceSetting
 from ...options import AssessmentOptions
 from ..analyser import Analyser
+from ..trustee_match import match_trustee
 
 # Trustees to skip (high-priv, expected to have service perms)
 _SKIP_TRUSTEES = {
@@ -55,25 +56,21 @@ class NtServiceAnalyser(Analyser):
                     if not interesting:
                         continue
 
-                    # Match against trustee options
-                    for to in options.trustee_options:
-                        if (to.get("display_name", "").lower() == ace.trustee.lower() or
-                                to.get("sid", "").lower() == ace.trustee.lower()):
-                            if to.get("high_priv", False):
-                                break
-                            if to.get("low_priv", False) or to.get("target", False):
-                                svc_name = setting.service_name or setting.name or ""
-                                self.add_finding(GpoFinding(
-                                    finding_reason="A Windows service's ACL is being configured to grant abusable permissions to a target trustee.",
-                                    finding_detail=(
-                                        f"This should allow local privilege escalation "
-                                        f"on affected hosts. Service: {svc_name}, "
-                                        f"Trustee: {ace.trustee}"
-                                    ),
-                                    triage=Triage.RED,
-                                    acl_result=[ace],
-                                ))
-                                break
+                    to = match_trustee(options, ace.trustee, ace.trustee_sid)
+                    if not to or to.get("high_priv"):
+                        continue
+                    if to.get("low_priv") or to.get("target"):
+                        svc_name = setting.service_name or setting.name or ""
+                        self.add_finding(GpoFinding(
+                            finding_reason="A Windows service's ACL is being configured to grant abusable permissions to a target trustee.",
+                            finding_detail=(
+                                f"This should allow local privilege escalation "
+                                f"on affected hosts. Service: {svc_name}, "
+                                f"Trustee: {to.get('display_name') or ace.trustee}"
+                            ),
+                            triage=Triage.RED,
+                            acl_result=[ace],
+                        ))
             except Exception:
                 pass
 

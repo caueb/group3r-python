@@ -40,6 +40,7 @@ class SmbClient:
         self.use_kerberos = use_kerberos
         self.target_domain = target_domain or domain
         self._connection = None
+        self._host_conns: dict = {}
 
     def connect(self) -> None:
         """Establish SMB connection to the domain controller."""
@@ -86,7 +87,7 @@ class SmbClient:
 
         logger.info("Connected to SMB: %s", target)
 
-    def enumerate_and_parse_sysvol(self) -> list[GPO]:
+    def enumerate_and_parse_sysvol(self, max_threads: int = 1) -> list[GPO]:
         """Read and parse GPO files directly from SYSVOL over SMB.
 
         No files are written to disk. Each file is read into memory,
@@ -96,34 +97,87 @@ class SmbClient:
             self.connect()
 
         share = "SYSVOL"
-        policies_path = self._find_policies_path(share)
-        if not policies_path:
+        policies_paths = self._find_policies_paths(share)
+        if not policies_paths:
             raise RuntimeError("Could not find Policies directory in SYSVOL share")
 
-        logger.info("Reading GPOs from SYSVOL: %s", policies_path)
+        logger.info("Reading GPOs from SYSVOL: %s", ", ".join(policies_paths))
 
-        # List GPO directories (GUID-named folders)
-        gpo_dirs = self._list_gpo_dirs(share, policies_path)
+        # List GPO directories (GUID-named folders), including NTFRS copies
+        gpo_dirs: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for policies_path in policies_paths:
+            for item in self._list_gpo_dirs(share, policies_path):
+                if item not in seen:
+                    seen.add(item)
+                    gpo_dirs.append(item)
         logger.info("Found %d GPO directories in SYSVOL", len(gpo_dirs))
 
-        gpos: list[GPO] = []
         total = len(gpo_dirs)
-        for i, (gpo_uid, gpo_path) in enumerate(gpo_dirs, 1):
-            print(f"\r[*] Reading SYSVOL: GPO {i}/{total}...",
-                  end="", flush=True, file=__import__("sys").stderr)
+        workers = max(1, min(max_threads or 1, total or 1))
 
-            is_morphed = "ntfrs" in gpo_path.lower()
-            gpo = GPO(uid=gpo_uid, path_in_sysvol=f"\\\\{self.dc_ip or self.domain}\\{share}\\{gpo_path}", morphed=is_morphed)
+        if workers <= 1:
+            gpos = []
+            for i, (gpo_uid, gpo_path) in enumerate(gpo_dirs, 1):
+                print(f"\r[*] Reading SYSVOL: GPO {i}/{total}...",
+                      end="", flush=True, file=__import__("sys").stderr)
+                gpo = self._load_one_gpo(share, gpo_uid, gpo_path)
+                if gpo and gpo.settings:
+                    gpos.append(gpo)
+            print(file=__import__("sys").stderr)
+            logger.info("Parsed %d GPOs with settings from SYSVOL", len(gpos))
+            return gpos
 
-            # Recursively find and parse all parseable files in this GPO
-            self._parse_gpo_files(share, gpo_path, gpo)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+        done = 0
+        lock = threading.Lock()
+        gpos: list[GPO] = []
 
-            if gpo.settings:
-                gpos.append(gpo)
+        def _job(item):
+            uid, path = item
+            client = self._clone()
+            try:
+                client.connect()
+                return client._load_one_gpo(share, uid, path)
+            finally:
+                client.close()
 
-        print(file=__import__("sys").stderr)  # newline after progress
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [pool.submit(_job, item) for item in gpo_dirs]
+            for fut in as_completed(futs):
+                with lock:
+                    done += 1
+                    print(f"\r[*] Reading SYSVOL: GPO {done}/{total}...",
+                          end="", flush=True, file=__import__("sys").stderr)
+                try:
+                    gpo = fut.result()
+                except Exception as e:
+                    logger.debug("GPO worker failed: %s", e)
+                    continue
+                if gpo and gpo.settings:
+                    gpos.append(gpo)
+        print(file=__import__("sys").stderr)
         logger.info("Parsed %d GPOs with settings from SYSVOL", len(gpos))
         return gpos
+
+    def _clone(self) -> "SmbClient":
+        return SmbClient(
+            domain=self.domain, dc_ip=self.dc_ip, dc_host=self.dc_host,
+            username=self.username, password=self.password,
+            hashes=self.hashes, use_kerberos=self.use_kerberos,
+            target_domain=self.target_domain,
+        )
+
+    def _load_one_gpo(self, share: str, gpo_uid: str, gpo_path: str) -> GPO:
+        is_morphed = "ntfrs" in gpo_path.lower()
+        gpo = GPO(
+            uid=gpo_uid,
+            path_in_sysvol=f"\\\\{self.dc_ip or self.domain}\\{share}\\{gpo_path}",
+            morphed=is_morphed,
+        )
+        self._parse_gpo_files(share, gpo_path, gpo)
+        return gpo
 
     def _list_gpo_dirs(self, share: str, policies_path: str) -> list[tuple[str, str]]:
         """List GUID-named GPO directories under the Policies path."""
@@ -190,49 +244,211 @@ class SmbClient:
             return None
 
     def _find_policies_path(self, share: str) -> Optional[str]:
-        """Find the Policies directory in the SYSVOL share."""
+        """Back-compat: first Policies directory found."""
+        paths = self._find_policies_paths(share)
+        return paths[0] if paths else None
+
+    def _find_policies_paths(self, share: str) -> list[str]:
+        """Find all Policies directories, including NTFRS/morphed copies.
+
+        Matches C# Sysvol.EnumerateGPODirectories: any child whose name
+        contains 'policies' is treated as a policy root.
+        """
+        found: list[str] = []
+
+        def _consider(path: str) -> None:
+            try:
+                entries = self._connection.listPath(share, path + "/*")
+            except Exception:
+                return
+            if entries:
+                logger.info("Found Policies at: %s/%s", share, path)
+                found.append(path)
+
         candidates = [self.target_domain]
         if self.domain != self.target_domain:
             candidates.append(self.domain)
 
-        for domain in candidates:
-            path = f"{domain}/Policies"
-            try:
-                entries = self._connection.listPath(share, path + "/*")
-                if entries:
-                    logger.info("Found Policies at: %s/%s", share, path)
-                    return path
-            except Exception:
-                logger.debug("Policies not found at %s/%s", share, path)
-
-        # Fallback: discover domain folders
+        # Standard {domain}/Policies plus any sibling whose name contains 'policies'
+        domain_folders: list[str] = []
         try:
-            entries = self._connection.listPath(share, "*")
+            for entry in self._connection.listPath(share, "*"):
+                name = entry.get_longname()
+                if name in (".", "..") or not entry.is_directory():
+                    continue
+                domain_folders.append(name)
+        except Exception as e:
+            logger.error("Failed to list SYSVOL root: %s", e)
+
+        search_roots = candidates + [n for n in domain_folders if n not in candidates]
+        for domain in search_roots:
+            try:
+                entries = self._connection.listPath(share, domain + "/*")
+            except Exception:
+                continue
             for entry in entries:
                 name = entry.get_longname()
                 if name in (".", "..") or not entry.is_directory():
                     continue
-                try_path = f"{name}/Policies"
-                try:
-                    sub = self._connection.listPath(share, try_path + "/*")
-                    if sub:
-                        logger.info("Discovered Policies at: %s/%s", share, try_path)
-                        return try_path
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.error("Failed to list SYSVOL root: %s", e)
+                if "policies" in name.lower():
+                    _consider(f"{domain}/{name}")
 
-        return None
+        # Last resort: {domain}/Policies even if listing the domain folder failed
+        if not found:
+            for domain in candidates:
+                _consider(f"{domain}/Policies")
+
+        return found
+
+    def query_path_security(self, unc_path: str) -> tuple[str, str]:
+        """Return (kind, sddl) for a UNC path.
+
+        kind is 'file', 'dir', 'parent', or '' if nothing could be opened.
+        """
+        parsed = _parse_unc(unc_path)
+        if not parsed:
+            return "", ""
+        host, share, rel = parsed
+        conn = self._connection_for(host)
+        if conn is None:
+            return "", ""
+
+        rel = rel.replace("/", "\\").lstrip("\\")
+        kind, sddl = self._query_rel(conn, share, rel)
+        if kind:
+            return kind, sddl
+
+        # Walk parents for a writable directory of a missing file
+        parent = rel
+        while True:
+            if "\\" in parent:
+                parent = parent.rsplit("\\", 1)[0]
+            elif parent:
+                parent = ""
+            else:
+                break
+            kind, sddl = self._query_rel(conn, share, parent, prefer_dir=True)
+            if kind == "dir":
+                return "parent", sddl
+        return "", ""
+
+    def _connection_for(self, host: str):
+        if not self._connection:
+            self.connect()
+        dc = (self.dc_host or self.dc_ip or self.target_domain or "").lower()
+        if host.lower() in {dc, (self.dc_ip or "").lower(), (self.target_domain or "").lower()}:
+            return self._connection
+        cached = self._host_conns.get(host.lower())
+        if cached is not None:
+            return cached
+        try:
+            from impacket.smbconnection import SMBConnection
+            remote_host = host
+            conn = SMBConnection(host, remote_host)
+            lm_hash = nt_hash = ""
+            if self.hashes:
+                parts = self.hashes.split(":", 1)
+                lm_hash = parts[0]
+                nt_hash = parts[1] if len(parts) > 1 else ""
+            if self.use_kerberos:
+                from .ldap_client import LdapClient
+                kdc = self.dc_ip or self.target_domain
+                TGT = LdapClient._get_tgt_from_ccache()
+                conn.kerberosLogin(
+                    self.username, self.password, self.domain,
+                    lm_hash, nt_hash, kdcHost=kdc, TGT=TGT,
+                )
+            else:
+                conn.login(self.username, self.password, self.domain, lm_hash, nt_hash)
+            self._host_conns[host.lower()] = conn
+            return conn
+        except Exception as e:
+            logger.debug("SMB connect to %s failed: %s", host, e)
+            return None
+
+    def _query_rel(self, conn, share: str, rel: str, prefer_dir: bool = False) -> tuple[str, str]:
+        order = ("dir", "file") if prefer_dir else ("file", "dir")
+        for kind in order:
+            try:
+                sddl = self._read_sddl(conn, share, rel, as_dir=(kind == "dir"))
+                if sddl:
+                    return kind, sddl
+            except Exception as e:
+                logger.debug("SMB %s open %s\\%s: %s", kind, share, rel, e)
+        return "", ""
+
+    def _read_sddl(self, conn, share: str, rel: str, as_dir: bool) -> str:
+        from impacket.smb3structs import (
+            FILE_READ_ATTRIBUTES, READ_CONTROL, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_SHARE_DELETE, FILE_NON_DIRECTORY_FILE,
+            FILE_DIRECTORY_FILE, FILE_OPEN, SMB2_0_INFO_SECURITY,
+        )
+        from impacket import smb as smb_mod
+
+        access = FILE_READ_ATTRIBUTES | READ_CONTROL
+        share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        opts = FILE_DIRECTORY_FILE if as_dir else FILE_NON_DIRECTORY_FILE
+        tree_id = conn.connectTree(share)
+        fid = None
+        try:
+            fid = conn.openFile(
+                tree_id, rel or "\\",
+                desiredAccess=access,
+                shareMode=share_mode,
+                creationOption=opts,
+                creationDisposition=FILE_OPEN,
+            )
+            if conn.getDialect() == smb_mod.SMB_DIALECT:
+                buf = conn._SMBConnection.query_sec_info(tree_id, fid, 7)
+            else:
+                buf = conn._SMBConnection.queryInfo(
+                    tree_id, fid,
+                    infoType=SMB2_0_INFO_SECURITY,
+                    fileInfoClass=0,
+                    additionalInformation=7,
+                )
+            from ..sddl.from_binary import security_descriptor_to_sddl
+            return security_descriptor_to_sddl(bytes(buf))
+        finally:
+            if fid is not None:
+                try:
+                    conn.closeFile(tree_id, fid)
+                except Exception:
+                    pass
+            try:
+                conn.disconnectTree(tree_id)
+            except Exception:
+                pass
 
     def close(self) -> None:
         """Close SMB connection."""
+        for conn in list(self._host_conns.values()):
+            try:
+                conn.logoff()
+            except Exception:
+                pass
+        self._host_conns.clear()
         if self._connection:
             try:
                 self._connection.logoff()
             except Exception:
                 pass
             self._connection = None
+
+
+def _parse_unc(path: str) -> Optional[tuple[str, str, str]]:
+    """Split \\\\host\\share\\rel into (host, share, rel)."""
+    if not path:
+        return None
+    norm = path.replace("/", "\\")
+    while norm.startswith("\\"):
+        norm = norm[1:]
+    parts = [p for p in norm.split("\\") if p]
+    if len(parts) < 2:
+        return None
+    host, share = parts[0], parts[1]
+    rel = "\\".join(parts[2:])
+    return host, share, rel
 
 
 def _determine_policy_type(filepath: str) -> PolicyType:

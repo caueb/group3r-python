@@ -25,27 +25,17 @@ def parse_ini_file(filepath: str, content: bytes | None = None) -> list[GpoSetti
     settings: list[GpoSetting] = []
 
     if content is not None:
-        for enc in ("utf-8-sig", "utf-16-le", "latin-1"):
-            try:
-                text = content.decode(enc)
-                lines = [line.rstrip("\n\r") for line in text.splitlines()]
-                break
-            except (UnicodeDecodeError, ValueError):
-                continue
-        else:
-            logger.error("Failed to decode ini content for %s", filepath)
-            return settings
+        from .util import decode_bytes
+        text = decode_bytes(content) if isinstance(content, (bytes, bytearray)) else content
+        lines = [line.rstrip("\n\r") for line in text.splitlines()]
     else:
         try:
-            with open(filepath, "r", encoding="utf-8-sig") as f:
-                lines = [line.rstrip("\n\r") for line in f.readlines()]
-        except Exception:
-            try:
-                with open(filepath, "r", encoding="utf-16-le") as f:
-                    lines = [line.rstrip("\n\r") for line in f.readlines()]
-            except Exception as e:
-                logger.error("Failed to read ini file %s: %s", filepath, e)
-                return settings
+            with open(filepath, "rb") as f:
+                from .util import decode_bytes
+                lines = [line.rstrip("\n\r") for line in decode_bytes(f.read()).splitlines()]
+        except Exception as e:
+            logger.error("Failed to read ini file %s: %s", filepath, e)
+            return settings
 
     content = "\n".join(lines)
     if not content.strip():

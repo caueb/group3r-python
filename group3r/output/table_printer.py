@@ -56,6 +56,11 @@ def format_gpo_result(result: GpoResult, findings_only: bool = False) -> str:
         rows.append(("Path in SYSVOL", attrs.path_in_sysvol))
     rows.append(("Computer Policy", "Enabled" if attrs.computer_policy_enabled else "Disabled"))
     rows.append(("User Policy", "Enabled" if attrs.user_policy_enabled else "Disabled"))
+    if attrs.wmi_filter_name or attrs.wmi_filter_query:
+        wmi = attrs.wmi_filter_name or attrs.wmi_filter_dn
+        if attrs.wmi_filter_query:
+            wmi = f"{wmi}: {attrs.wmi_filter_query}" if wmi else attrs.wmi_filter_query
+        rows.append(("WMI Filter", wmi))
     for link in (attrs.gpo_links or []):
         enforced = f" ({link.link_enforced})" if link.link_enforced else ""
         rows.append(("Link", f"{link.link_path}{enforced}"))
@@ -156,6 +161,8 @@ def _format_setting(setting: Optional[GpoSetting]) -> str:
 def _get_setting_rows(setting: GpoSetting) -> list[tuple[str, str]]:
     """Extract display rows for each setting type, matching C# NiceGpoPrinter."""
     rows: list[tuple[str, str]] = []
+    if getattr(setting, "has_filters", False):
+        _add(rows, "Item Filters", "Present (setting may not apply to all targets)")
 
     if isinstance(setting, RegistrySetting):
         _add(rows, "Name", setting.name)
