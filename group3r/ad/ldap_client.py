@@ -265,7 +265,7 @@ class LdapClient:
                     if str(attr["type"]) == "defaultNamingContext":
                         vals = attr["vals"]
                         if vals:
-                            dn = str(vals[0])
+                            dn = _ldap_str(vals[0])
                             logger.info("Base DN from RootDSE: %s", dn)
                             return dn
         except Exception as e:
@@ -311,7 +311,20 @@ class LdapClient:
                 vals = attr["vals"]
                 if not vals:
                     continue
-                val = str(vals[0])
+
+                # Binary attributes must not go through str() — pyasn1 OctetString
+                # tries utf-8 and raises on nTSecurityDescriptor / objectSid / GUIDs.
+                if attr_name == "nTSecurityDescriptor":
+                    try:
+                        from ..sddl.from_binary import security_descriptor_to_sddl
+                        attrs.nt_security_descriptor = security_descriptor_to_sddl(
+                            _ldap_bytes(vals[0])
+                        )
+                    except Exception as e:
+                        logger.debug("Failed to parse SD: %s", e)
+                    continue
+
+                val = _ldap_str(vals[0])
 
                 if attr_name == "displayName":
                     attrs.display_name = val
@@ -336,13 +349,6 @@ class LdapClient:
                         pass
                 elif attr_name == "gPCWQLFilter":
                     attrs.wmi_filter_dn = _wmi_filter_dn(val)
-                elif attr_name == "nTSecurityDescriptor":
-                    try:
-                        raw = bytes(vals[0])
-                        from ..sddl.from_binary import security_descriptor_to_sddl
-                        attrs.nt_security_descriptor = security_descriptor_to_sddl(raw)
-                    except Exception as e:
-                        logger.debug("Failed to parse SD: %s", e)
 
             gpos.append(gpo)
 
@@ -474,9 +480,9 @@ class LdapClient:
             for attr in item["attributes"]:
                 name = str(attr["type"]).lower()
                 if name == "distinguishedname" and attr["vals"]:
-                    ou_dn = str(attr["vals"][0])
+                    ou_dn = _ldap_str(attr["vals"][0])
                 elif name == "gplink" and attr["vals"]:
-                    gplink_val = str(attr["vals"][0])
+                    gplink_val = _ldap_str(attr["vals"][0])
 
             if not gplink_val:
                 continue
@@ -635,11 +641,13 @@ class LdapClient:
                 if not vals:
                     continue
                 if name == "msiFileList":
-                    attrs[name] = [str(v) for v in vals]
+                    attrs[name] = [_ldap_str(v) for v in vals]
                 elif name in ("whenCreated", "whenChanged"):
-                    attrs[name] = _parse_ldap_timestamp(str(vals[0]))
+                    attrs[name] = _parse_ldap_timestamp(_ldap_str(vals[0]))
+                elif name in ("productCode", "upgradeProductCode"):
+                    attrs[name] = _ldap_bytes(vals[0])
                 else:
-                    attrs[name] = str(vals[0])
+                    attrs[name] = _ldap_str(vals[0])
             self._attach_package(gpos, attrs)
             count += 1
         logger.info("Attached %d software packages from LDAP", count)
@@ -766,12 +774,12 @@ class LdapClient:
                 if not attr["vals"]:
                     continue
                 if name == "distinguishedName":
-                    user_dn = str(attr["vals"][0])
+                    user_dn = _ldap_str(attr["vals"][0])
                 elif name == "cn":
-                    user_cn = str(attr["vals"][0])
+                    user_cn = _ldap_str(attr["vals"][0])
                 elif name == "objectSid":
                     try:
-                        user_sid = LDAP_SID(data=bytes(attr["vals"][0])).formatCanonical()
+                        user_sid = LDAP_SID(data=_ldap_bytes(attr["vals"][0])).formatCanonical()
                     except Exception:
                         user_sid = ""
             if user_dn:
@@ -801,7 +809,7 @@ class LdapClient:
                 if str(attr["type"]) == "tokenGroups":
                     for val in attr["vals"]:
                         try:
-                            sids.append(LDAP_SID(data=bytes(val)).formatCanonical())
+                            sids.append(LDAP_SID(data=_ldap_bytes(val)).formatCanonical())
                         except Exception:
                             pass
         results.extend(self._resolve_group_sids(sids))
@@ -885,11 +893,11 @@ class LdapClient:
                             if not attr["vals"]:
                                 continue
                             if n == "cn":
-                                cn = str(attr["vals"][0])
+                                cn = _ldap_str(attr["vals"][0])
                             elif n == "sAMAccountName" and not cn:
-                                cn = str(attr["vals"][0])
+                                cn = _ldap_str(attr["vals"][0])
                             elif n == "objectSid":
-                                sid = LDAP_SID(data=bytes(attr["vals"][0])).formatCanonical()
+                                sid = LDAP_SID(data=_ldap_bytes(attr["vals"][0])).formatCanonical()
                         if sid:
                             names[sid] = cn or sid
                 else:
@@ -957,9 +965,9 @@ class LdapClient:
                     if not attr["vals"]:
                         continue
                     if n in ("msWMI-Name", "displayName") and not name:
-                        name = str(attr["vals"][0])
+                        name = _ldap_str(attr["vals"][0])
                     elif n == "msWMI-Parm1":
-                        query = str(attr["vals"][0])
+                        query = _ldap_str(attr["vals"][0])
             return name, query
 
         import ldap3
@@ -993,6 +1001,38 @@ class LdapClient:
             except Exception:
                 pass
             self._connection = None
+
+
+def _ldap_bytes(val) -> bytes:
+    """Extract raw bytes from an impacket/pyasn1 LDAP value."""
+    if isinstance(val, bytes):
+        return val
+    if isinstance(val, (bytearray, memoryview)):
+        return bytes(val)
+    if hasattr(val, "asOctets"):
+        try:
+            return val.asOctets()
+        except Exception:
+            pass
+    try:
+        return bytes(val)
+    except Exception:
+        return b""
+
+
+def _ldap_str(val) -> str:
+    """Decode an LDAP value as text without crashing on binary OctetStrings."""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    raw = _ldap_bytes(val)
+    for enc in ("utf-8", "utf-16-le"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")
 
 
 def _ldap_escape(value: str) -> str:
